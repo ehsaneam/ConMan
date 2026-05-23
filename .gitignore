@@ -7,3 +7,5 @@ models/
 #Extension
 *.png
 *.pth
+*.pyc
+*backup*
