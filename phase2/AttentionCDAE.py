@@ -196,24 +196,38 @@ def train():
         print("Loaded best existing model.")
 
     for epoch in range(EPOCHS):
-        total_loss = 0.0
+        total_epoch_loss = 0.0
 
         for data in datasets:
             wid = list(data.keys())
             T = len(next(iter(data.values()))["cpu"])
+            precomputed_inputs = {w: torch.stack([build_input(data, w, t) for t in range(T)])
+                for w in wid}
+
+            # Optimization: Pre-move ground truth data to device for faster access
+            gt_data_on_device = {}
+            for w_key in wid:
+                gt_data_on_device[w_key] = {
+                    "cpu": torch.tensor(data[w_key]["cpu"], dtype=torch.float32).to(DEVICE),
+                    "cache": torch.tensor(data[w_key]["cache"], dtype=torch.float32).to(DEVICE),
+                    "mem": torch.tensor(data[w_key]["mem"], dtype=torch.float32).to(DEVICE)
+                }
 
             start_vec = [0] + [
                 random.randint(1, T - ROLLOUT_STEPS - 1)
                 for _ in range(len(wid)-1)
             ]
 
+            optimizer.zero_grad() # Zero gradients once per data block
+            current_data_block_loss = 0.0 # Accumulate loss for this data block
+
             for start in start_vec:
-                loss = 0.0
+                segment_loss = 0.0 # Loss for the current segment
                 hidden = None
 
                 # warm-up until start
                 for t in range(start):
-                    base_inputs = [build_input(data, w, t) for w in wid]
+                    base_inputs = [precomputed_inputs[w][t] for w in wid]
                     with torch.no_grad():
                         first_out = model.first_pass(base_inputs, wid, hidden)
                         _, hidden = model.second_pass(base_inputs, wid, hidden, first_out)
@@ -224,29 +238,33 @@ def train():
                     if t >= T:
                         break
 
-                    base_inputs = [build_input(data, w, t) for w in wid]
+                    base_inputs = [precomputed_inputs[w][t] for w in wid]
                     first_out = model.first_pass(base_inputs, wid, hidden)
                     second_out, hidden = model.second_pass(base_inputs, wid, hidden, first_out)
 
                     for w in wid:
-                        gt = torch.tensor([
-                            data[w]["cpu"][t],
-                            data[w]["cache"][t],
-                            data[w]["mem"][t]
-                        ]).float().to(DEVICE)
+                        # Use pre-moved ground truth data
+                        gt = torch.stack([
+                            gt_data_on_device[w]["cpu"][t],
+                            gt_data_on_device[w]["cache"][t],
+                            gt_data_on_device[w]["mem"][t]
+                        ])
 
-                        loss += mse(second_out[w].squeeze(), gt)
+                        segment_loss += mse(second_out[w].squeeze(), gt)
+                
+                # Accumulate segment loss for backpropagation later
+                current_data_block_loss += segment_loss 
 
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                total_loss += loss.item()
+            if current_data_block_loss > 0: # Ensure loss is not zero before backward
+                current_data_block_loss.backward() # Backpropagate once for the entire data block
+                optimizer.step() # Update weights once for the entire data block
+            total_epoch_loss += current_data_block_loss.item() # Accumulate total epoch loss
         
-        train_losses.append(total_loss)
-        print(f"Epoch {epoch} Loss {total_loss:.4f}")
+        train_losses.append(total_epoch_loss)
+        print(f"Epoch {epoch} Loss {total_epoch_loss:.4f}")
 
-        if total_loss < best_loss:
-            best_loss = total_loss
+        if total_epoch_loss < best_loss:
+            best_loss = total_epoch_loss
             torch.save(model.state_dict(), SAVE_PATH)
             print("Best model saved.")
 
