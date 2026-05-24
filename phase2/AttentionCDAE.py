@@ -13,10 +13,11 @@ MAX_COLOCATED = 6
 HIDDEN = 64
 ROLLOUT_STEPS = 24
 EPOCHS = 60
+TRAIN_SEGMENTS_PER_DATASET = 5  # None keeps the old len(wid) behavior
 
 LR_CDAE = 1e-4
 LR_AGG  = 5e-4
-MODE = "eval"   # "train" or "eval"
+MODE = "train"   # "train" or "eval"
 
 MODEL_DIR = "models"
 TRACE_FILE = "traces/colocated_traces.txt"
@@ -48,6 +49,32 @@ def build_input(data, w, t):
         data[w]["mem"][t],
         time
     ]).float().view(1,1,4).to(DEVICE)
+
+def build_inputs_and_targets(data, wid):
+    inputs = {}
+    targets = {}
+
+    for w in wid:
+        cpu = torch.tensor(data[w]["cpu"], dtype=torch.float32, device=DEVICE)
+        cache = torch.tensor(data[w]["cache"], dtype=torch.float32, device=DEVICE)
+        mem = torch.tensor(data[w]["mem"], dtype=torch.float32, device=DEVICE)
+        trace = torch.stack([cpu, cache, mem], dim=1)
+
+        active = trace.abs().sum(dim=1) > 0.5
+        time = torch.zeros_like(cpu)
+        active_idx = active.nonzero(as_tuple=True)[0]
+        time[active_idx] = active_idx.float() - data[w]["offset"]
+        if 0 <= data[w]["offset"] - 1 < time.numel():
+            time[data[w]["offset"] - 1] = torch.where(
+                active[data[w]["offset"] - 1],
+                time[data[w]["offset"] - 1],
+                torch.tensor(-1.0, device=DEVICE)
+            )
+
+        inputs[w] = torch.cat([trace, time.unsqueeze(1)], dim=1)
+        targets[w] = trace
+
+    return inputs, targets
 
 def parse_trace_file(path):
 
@@ -149,9 +176,10 @@ class Phase2Model(nn.Module):
             hidden = {}
 
         for i, w in enumerate(wid):
+            batch_size = base_inputs[i].shape[0]
             if w not in hidden or hidden[w] is None:
-                hidden[w] = torch.zeros(2, 1, HIDDEN).to(DEVICE)
-            x = torch.cat([base_inputs[i], torch.zeros(1,1,1).to(DEVICE)], dim=2)  # interference=0
+                hidden[w] = self._zero_hidden(batch_size)
+            x = torch.cat([base_inputs[i], torch.zeros(batch_size, 1, 1, device=DEVICE)], dim=2)  # interference=0
             trace, _, _ = self.cdae_models[w](x, hidden[w])
             outputs[w] = trace.squeeze(1).detach()  # detach graph
 
@@ -168,14 +196,18 @@ class Phase2Model(nn.Module):
             hidden = {}
 
         for i, w in enumerate(wid):
+            batch_size = base_inputs[i].shape[0]
             if w not in hidden or hidden[w] is None:
-                hidden[w] = torch.zeros(2, 1, HIDDEN).to(DEVICE)
+                hidden[w] = self._zero_hidden(batch_size)
             x = torch.cat([base_inputs[i], interference], dim=2)
             trace, _, h_new = self.cdae_models[w](x, hidden[w])
             outputs[w] = trace.squeeze(1)
             new_hidden[w] = h_new
 
         return outputs, new_hidden
+
+    def _zero_hidden(self, batch_size):
+        return torch.zeros(2, batch_size, HIDDEN, device=DEVICE)
 
 # =========================================================
 # Training
@@ -192,8 +224,10 @@ def train():
     train_losses = []
 
     if os.path.exists(SAVE_PATH):
-        model.load_state_dict(torch.load(SAVE_PATH, map_location=DEVICE))
-        print("Loaded best existing model.")
+        checkpoint = torch.load(SAVE_PATH, map_location=DEVICE)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        best_loss = checkpoint['best_loss']
+        print(f"Loaded best existing model and best_loss: {best_loss:.4f}.")
 
     for epoch in range(EPOCHS):
         total_epoch_loss = 0.0
@@ -201,72 +235,80 @@ def train():
         for data in datasets:
             wid = list(data.keys())
             T = len(next(iter(data.values()))["cpu"])
-            precomputed_inputs = {w: torch.stack([build_input(data, w, t) for t in range(T)])
-                for w in wid}
+            inputs, targets = build_inputs_and_targets(data, wid)
+            max_start = max(0, T - ROLLOUT_STEPS)
+            num_segments = TRAIN_SEGMENTS_PER_DATASET or len(wid)
+            if max_start > 0:
+                start_vec = [0] + [
+                    random.randint(1, max_start)
+                    for _ in range(max(0, num_segments - 1))
+                ]
+            else:
+                start_vec = [0]
 
-            # Optimization: Pre-move ground truth data to device for faster access
-            gt_data_on_device = {}
-            for w_key in wid:
-                gt_data_on_device[w_key] = {
-                    "cpu": torch.tensor(data[w_key]["cpu"], dtype=torch.float32).to(DEVICE),
-                    "cache": torch.tensor(data[w_key]["cache"], dtype=torch.float32).to(DEVICE),
-                    "mem": torch.tensor(data[w_key]["mem"], dtype=torch.float32).to(DEVICE)
-                }
+            start_indices = torch.tensor(start_vec, dtype=torch.long, device=DEVICE)
+            batch_size = start_indices.numel()
 
-            start_vec = [0] + [
-                random.randint(1, T - ROLLOUT_STEPS - 1)
-                for _ in range(len(wid)-1)
-            ]
+            optimizer.zero_grad()
+            current_data_block_loss = torch.zeros((), device=DEVICE)
+            hidden = {w: model._zero_hidden(batch_size) for w in wid}
 
-            optimizer.zero_grad() # Zero gradients once per data block
-            current_data_block_loss = 0.0 # Accumulate loss for this data block
+            # Warm up each sampled segment to its own start index in one batched pass.
+            for t in range(int(start_indices.max().item())):
+                active_segments = (start_indices > t).nonzero(as_tuple=True)[0]
+                if active_segments.numel() == 0:
+                    continue
 
-            for start in start_vec:
-                segment_loss = 0.0 # Loss for the current segment
-                hidden = None
+                active_hidden = {w: hidden[w][:, active_segments, :].contiguous() for w in wid}
+                base_inputs = [
+                    inputs[w][torch.full((active_segments.numel(),), t, dtype=torch.long, device=DEVICE)].unsqueeze(1)
+                    for w in wid
+                ]
 
-                # warm-up until start
-                for t in range(start):
-                    base_inputs = [precomputed_inputs[w][t] for w in wid]
-                    with torch.no_grad():
-                        first_out = model.first_pass(base_inputs, wid, hidden)
-                        _, hidden = model.second_pass(base_inputs, wid, hidden, first_out)
+                with torch.no_grad():
+                    first_out = model.first_pass(base_inputs, wid, active_hidden)
+                    _, updated_hidden = model.second_pass(base_inputs, wid, active_hidden, first_out)
 
-                # rollout
-                for k in range(ROLLOUT_STEPS):
-                    t = start + k
-                    if t >= T:
-                        break
+                for w in wid:
+                    hidden[w][:, active_segments, :] = updated_hidden[w].detach()
 
-                    base_inputs = [precomputed_inputs[w][t] for w in wid]
-                    first_out = model.first_pass(base_inputs, wid, hidden)
-                    second_out, hidden = model.second_pass(base_inputs, wid, hidden, first_out)
+            # Roll out all sampled starts as one batch per workload-specific CDAE.
+            for k in range(min(ROLLOUT_STEPS, T)):
+                t_indices = start_indices + k
+                valid_segments = (t_indices < T).nonzero(as_tuple=True)[0]
+                if valid_segments.numel() == 0:
+                    break
 
-                    for w in wid:
-                        # Use pre-moved ground truth data
-                        gt = torch.stack([
-                            gt_data_on_device[w]["cpu"][t],
-                            gt_data_on_device[w]["cache"][t],
-                            gt_data_on_device[w]["mem"][t]
-                        ])
+                step_indices = t_indices[valid_segments]
+                active_hidden = {w: hidden[w][:, valid_segments, :].contiguous() for w in wid}
+                base_inputs = [inputs[w][step_indices].unsqueeze(1) for w in wid]
 
-                        segment_loss += mse(second_out[w].squeeze(), gt)
-                
-                # Accumulate segment loss for backpropagation later
-                current_data_block_loss += segment_loss 
+                first_out = model.first_pass(base_inputs, wid, active_hidden)
+                second_out, updated_hidden = model.second_pass(base_inputs, wid, active_hidden, first_out)
 
-            if current_data_block_loss > 0: # Ensure loss is not zero before backward
-                current_data_block_loss.backward() # Backpropagate once for the entire data block
-                optimizer.step() # Update weights once for the entire data block
-            total_epoch_loss += current_data_block_loss.item() # Accumulate total epoch loss
-        
+                for w in wid:
+                    current_data_block_loss = current_data_block_loss + mse(
+                        second_out[w],
+                        targets[w][step_indices]
+                    )
+                    hidden[w] = updated_hidden[w]
+
+            if current_data_block_loss.requires_grad:
+                current_data_block_loss.backward()
+                optimizer.step()
+
+            total_epoch_loss += current_data_block_loss.item()
+
         train_losses.append(total_epoch_loss)
         print(f"Epoch {epoch} Loss {total_epoch_loss:.4f}")
 
         if total_epoch_loss < best_loss:
             best_loss = total_epoch_loss
-            torch.save(model.state_dict(), SAVE_PATH)
-            print("Best model saved.")
+            torch.save({
+                'model_state_dict': model.state_dict(),
+                'best_loss': best_loss,
+            }, SAVE_PATH)
+            print("Best model and best_loss saved.")
 
     print("Training finished.")
     os.makedirs(IMAGES_DIR, exist_ok=True)
@@ -289,7 +331,8 @@ def eval():
     datasets = parse_trace_file(TRACE_FILE)
     os.makedirs(IMAGES_DIR, exist_ok=True)
     model = Phase2Model().to(DEVICE)
-    model.load_state_dict(torch.load(SAVE_PATH))
+    checkpoint = torch.load(SAVE_PATH, map_location=DEVICE)
+    model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
     start = 20
 
